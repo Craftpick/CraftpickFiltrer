@@ -1,0 +1,7 @@
+# Une IP ou un CIDR par ligne — jamais filtré ni banni par Craftpick Filter.
+# install.sh y ajoute automatiquement l'IP SSH depuis laquelle tu installes.
+# Copié vers /etc/craftpick-filter/whitelist.txt à l'installation (s'il n'existe pas déjà).
+#
+# Exemples :
+# 203.0.113.42
+# 198.51.100.0/24

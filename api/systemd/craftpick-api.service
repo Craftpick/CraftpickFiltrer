@@ -1,0 +1,15 @@
+[Unit]
+Description=Craftpick API - reception attaques + pilotage Craftpick Filter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env node /opt/craftpick-filtrer/api/server.js
+Restart=always
+RestartSec=3
+Environment=CRAFTPICK_API_CONFIG=/etc/craftpick-api/config.json
+User=root
+
+[Install]
+WantedBy=multi-user.target

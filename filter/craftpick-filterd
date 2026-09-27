@@ -1,0 +1,346 @@
+#!/usr/bin/env bash
+# Craftpick Filter — démon d'analyse du trafic et d'export des attaques
+set -uo pipefail
+export LC_ALL=C LC_NUMERIC=C   # évite les nombres à virgule (locale FR) qui cassent le JSON envoyé à jq
+source /etc/craftpick-filter/config.conf
+
+T=craftpick_filter
+VAR=/var/lib/craftpick-filter; SPOOL=$VAR/spool; RUN=/run/craftpick-filter
+LOG=/var/log/craftpick-filter.log
+mkdir -p "$SPOOL" "$RUN"
+
+# ---------- utilitaires ----------
+log()     { local m="[$(date '+%F %T')] $*"; echo "$m"; echo "$m" >> "$LOG"; }
+fcalc()   { awk "BEGIN{printf \"%.2f\", $1}"; }
+fgt()     { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 > b+0)}'; }
+fam()     { [[ $1 == *:* ]] && echo 6 || echo 4; }
+counter() { nft -j list counter inet $T "$1" 2>/dev/null | jq -r '[.nftables[]|select(.counter)|.counter.packets][0] // 0'; }
+ifstat()  { echo "$(< /sys/class/net/$INTERFACE/statistics/rx_packets) $(< /sys/class/net/$INTERFACE/statistics/rx_bytes)"; }
+
+SS_ARGS=()
+if [[ ${PORTS,,} != "all" ]]; then
+  f=""; IFS=, read -ra PA <<< "$PORTS"
+  for p in "${PA[@]}"; do f+="${f:+ or }sport = :$p"; done
+  SS_ARGS=("( $f )")
+fi
+peers() {
+  ss -Htn state "$1" "${SS_ARGS[@]}" 2>/dev/null \
+    | awk '{a=$4; sub(/:[0-9]+$/,"",a); gsub(/\[|\]/,"",a); sub(/^::ffff:/,"",a); if(a!="") print a}'
+}
+whitelisted() { nft get element inet $T "whitelist$(fam "$1")" "{ $1 }" &>/dev/null; }
+is_banned()   { nft get element inet $T "blacklist$(fam "$1")" "{ $1 }" &>/dev/null; }
+
+# ---------- export API (avec file d'attente si l'API est down) ----------
+api_post() {
+  curl -fsS -m 5 -o /dev/null -X POST \
+    -H "Content-Type: application/json" -H "Authorization: Bearer ${API_KEY}" \
+    --data-binary "$1" "$API_URL" 2>/dev/null
+}
+api_send() {
+  [[ -z ${API_URL:-} ]] && return 0
+  api_post "$1" || { echo "$1" > "$SPOOL/$(date +%s%N).json"; log "API injoignable → événement mis en file d'attente"; }
+}
+flush_spool() {
+  [[ -z ${API_URL:-} ]] && return 0
+  local f
+  for f in "$SPOOL"/*.json; do
+    [[ -e $f ]] || return 0
+    if api_post "@$f"; then rm -f "$f"; else return 0; fi
+  done
+}
+
+attack_json() {
+  local banned_json types
+  banned_json=$(printf '%s\n' "${BANNED[@]}" | jq -Rsc 'split("\n")|map(select(length>0))|unique')
+  types=$(IFS=,; echo "${!A_TYPES[*]}")
+  jq -nc --arg ev "$1" --arg s "$SERVER_NAME" --arg id "$ATTACK_ID" --arg types "$types" \
+    --arg st "$A_START" --arg en "${2:-}" --argjson dur $(( A_LAST_TS - A_START_TS )) \
+    --argjson pps "$pk_pps" --argjson mbps "$pk_mbps" --argjson cps "$pk_cps" \
+    --argjson conns "$pk_conns" --argjson syn "$pk_syn" --argjson httprps "$pk_http_rps" \
+    --argjson dropped "$A_DROPPED" \
+    --argjson bc "$b_cps" --argjson bn "$b_conns" --argjson bp "$b_pps" --argjson bh "$b_http_rps" \
+    --argjson banned "$banned_json" \
+    '{event:$ev, server:$s, attack_id:$id, types:($types|split(",")),
+      started_at:$st, ended_at:(if $en=="" then null else $en end), duration_s:$dur,
+      peak:{pps:$pps, mbps:$mbps, new_conn_per_s:$cps, conns:$conns, syn_recv:$syn, http_rps:$httprps},
+      dropped_packets:$dropped,
+      baseline:{new_conn_per_s:$bc, conns:$bn, pps:$bp, http_rps:$bh},
+      banned_ips:$banned, banned_count:($banned|length)}'
+}
+
+# ---------- mitigation ----------
+ban() {
+  local ip=$1 why=$2 dur="${3:-$BAN_DURATION}"
+  whitelisted "$ip" && return 0
+  is_banned "$ip" && return 0
+  nft add element inet $T "blacklist$(fam "$ip")" "{ $ip timeout $dur }" 2>/dev/null || return 0
+  ss -K dst "$ip" &>/dev/null   # coupe les connexions déjà ouvertes
+  log "⛔ BAN $ip pour $dur ($why)"
+  if [[ -n $ATTACK_ID ]]; then
+    BANNED+=("$ip")
+  elif (( EXPORT_BANS )); then
+    api_send "$(jq -nc --arg s "$SERVER_NAME" --arg ip "$ip" --arg why "$why" --arg d "$BAN_DURATION" \
+      '{event:"ban", server:$s, ip:$ip, reason:$why, duration:$d, ts:(now|todate)}')"
+  fi
+}
+# ---------- protection HTTP (couche 7) ----------
+# Un flood HTTP arrive souvent via peu de connexions gardées ouvertes (keep-alive) qui
+# envoient beaucoup de requêtes : invisible pour le compteur "nouvelle connexion" TCP.
+# On lit donc directement le(s) log(s) d'accès du serveur web, en tenant un offset
+# d'octets par fichier pour ne traiter que ce qui a été ajouté depuis le dernier cycle.
+declare -A HTTP_OFFSET
+HTTP_FILES=()
+http_discover() {
+  local pattern f k already
+  for pattern in $HTTP_LOG_PATHS; do
+    for f in $pattern; do
+      [[ -f $f && -r $f ]] || continue
+      already=0
+      for k in "${HTTP_FILES[@]}"; do [[ $k == "$f" ]] && already=1 && break; done
+      if (( ! already )); then
+        HTTP_FILES+=("$f")
+        HTTP_OFFSET[$f]=$(stat -c%s "$f" 2>/dev/null || echo 0)   # on ne lit que le futur, pas l'historique
+      fi
+    done
+  done
+}
+if (( HTTP_ENABLE )); then
+  http_discover
+  if (( ${#HTTP_FILES[@]} == 0 )); then
+    log "⚠️  Protection HTTP : aucun log d'accès trouvé (HTTP_LOG_PATHS dans config.conf) — désactivée pour cette session"
+    HTTP_ENABLE=0
+  else
+    log "Protection HTTP active sur : ${HTTP_FILES[*]}"
+  fi
+fi
+
+# Renseigne la variable globale HTTP_TOTAL (pas de "echo $total" : ban()/log() écrivent
+# sur stdout, une substitution de commande capturerait leurs lignes de log par erreur).
+HTTP_TOTAL=0
+http_scan() {
+  local f sz off chunk limit thresh cnt ip n
+  HTTP_TOTAL=0
+  (( HTTP_ENABLE )) || return 0
+  limit=$HTTP_PER_IP_RPS_MAX; [[ -n $ATTACK_ID ]] && limit=$HTTP_PER_IP_RPS_MAX_ATTACK
+  thresh=$(( limit * INTERVAL ))
+  for f in "${HTTP_FILES[@]}"; do
+    [[ -r $f ]] || continue
+    sz=$(stat -c%s "$f" 2>/dev/null) || continue
+    off=${HTTP_OFFSET[$f]:-$sz}
+    (( sz < off )) && off=0   # rotation (logrotate) : le fichier a été recréé/tronqué
+    if (( sz > off )); then
+      chunk=$(tail -c +$((off+1)) "$f" 2>/dev/null)
+      HTTP_OFFSET[$f]=$sz
+      if [[ -n $chunk ]]; then
+        n=$(grep -c . <<< "$chunk")
+        HTTP_TOTAL=$(( HTTP_TOTAL + n ))
+        while read -r cnt ip; do
+          [[ -n $ip ]] || continue
+          (( cnt > thresh )) || break
+          ban "$ip" "${cnt} req HTTP/${INTERVAL}s" "$HTTP_BAN_DURATION"
+        done < <(awk '$1 ~ /^[0-9a-fA-F:.]+$/ {print $1}' <<< "$chunk" | sort | uniq -c | sort -rn)
+      fi
+    else
+      HTTP_OFFSET[$f]=$sz
+    fi
+  done
+}
+
+lockdown_on() {
+  (( LOCKDOWN )) || return 0
+  nft add rule inet $T lockdown ip saddr != @known4 limit rate over ${LOCKDOWN_CPS}/second counter name "dropped" drop
+  nft add rule inet $T lockdown ip6 saddr != @known6 limit rate over ${LOCKDOWN_CPS}/second counter name "dropped" drop
+  log "🔒 Lockdown activé : IP inconnues limitées à ${LOCKDOWN_CPS} co/s au total"
+}
+lockdown_off() {
+  nft flush chain inet $T lockdown 2>/dev/null
+  [[ ${1:-} == quiet ]] || { (( LOCKDOWN )) && log "🔓 Lockdown désactivé"; }
+}
+
+whitelist_add() {
+  local ip=$1
+  grep -qxF "$ip" /etc/craftpick-filter/whitelist.txt 2>/dev/null || echo "$ip" >> /etc/craftpick-filter/whitelist.txt
+  nft delete element inet $T "blacklist$(fam "$ip")" "{ $ip }" &>/dev/null
+  nft add element inet $T "whitelist$(fam "$ip")" "{ $ip }" 2>/dev/null
+  log "📥 Whitelist (API) : $ip"
+}
+
+# ---------- contrôle distant : l'API peut envoyer des commandes ----------
+# Contrat attendu côté API (à toi de coder l'endpoint PHP) :
+#   GET  {API_CMD}?server=<SERVER_NAME>   header Authorization: Bearer <API_KEY>
+#        -> {"commands":[
+#             {"id":1,"action":"ban","ip":"1.2.3.4","duration":"2h"},
+#             {"id":2,"action":"unban","ip":"1.2.3.4"},
+#             {"id":3,"action":"whitelist","ip":"5.6.7.8"},
+#             {"id":4,"action":"lockdown","state":"on"},   // ou "off"
+#             {"id":5,"action":"reset_baseline"}
+#           ]}
+#   POST {API_CMD}/ack                     header Authorization: Bearer <API_KEY>
+#        body {"server":"<SERVER_NAME>","ack":[1,2,3,4,5]}
+#        (l'API marque ces IDs comme traités pour ne pas les renvoyer)
+API_CMD="${API_CMD_URL:-${API_URL:+${API_URL%/}/commands}}"
+
+run_command() {
+  local action=$1 ip=$2 dur=$3 state=$4
+  case "$action" in
+    ban)            [[ -n $ip ]] && ban "$ip" "commande API" "${dur:-$BAN_DURATION}" ;;
+    unban)          [[ -n $ip ]] && { nft delete element inet $T "blacklist$(fam "$ip")" "{ $ip }" 2>/dev/null; log "📥 Unban (API) : $ip"; } ;;
+    whitelist)      [[ -n $ip ]] && whitelist_add "$ip" ;;
+    lockdown)       [[ $state == on ]] && lockdown_on || lockdown_off ;;
+    reset_baseline) echo "0 0 0 0" > "$VAR/baseline"; b_cps=0; b_conns=0; b_pps=0; b_http_rps=0; log "📥 Reset baseline (API)" ;;
+    *)              log "⚠️  Commande API inconnue : $action" ;;
+  esac
+}
+
+poll_commands() {
+  (( REMOTE_CONTROL )) || return 0
+  [[ -z ${API_CMD:-} ]] && return 0
+  local resp ids=()
+  resp=$(curl -fsS -m 5 -H "Authorization: Bearer ${API_KEY}" "${API_CMD}?server=${SERVER_NAME}" 2>/dev/null) || return 0
+  [[ -z $resp ]] && return 0
+  while IFS=$'\t' read -r id action ip dur state; do
+    [[ -z $id ]] && continue
+    run_command "$action" "$ip" "$dur" "$state"
+    ids+=("$id")
+  done < <(jq -r '.commands[]? | [(.id|tostring), (.action//""), (.ip//""), (.duration//""), (.state//"")] | @tsv' <<< "$resp" 2>/dev/null)
+  if (( ${#ids[@]} )); then
+    local idjson; idjson=$(printf '%s\n' "${ids[@]}" | jq -Rsc 'split("\n")|map(select(length>0)|tonumber)')
+    curl -fsS -m 5 -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${API_KEY}" \
+      --data-binary "$(jq -nc --arg s "$SERVER_NAME" --argjson ids "$idjson" '{server:$s, ack:$ids}')" \
+      "${API_CMD}/ack" &>/dev/null
+    log "📥 ${#ids[@]} commande(s) API exécutée(s)"
+  fi
+}
+
+# ---------- état ----------
+ATTACK_ID=""; A_START=""; A_START_TS=0; A_LAST=""; A_LAST_TS=0; A_DROPPED=0
+calm=0; cycle=0; started=0
+declare -A A_TYPES=(); BANNED=()
+pk_pps=0; pk_mbps=0; pk_cps=0; pk_conns=0; pk_syn=0; pk_http_rps=0
+b_cps=0; b_conns=0; b_pps=0; b_http_rps=0
+if [[ -s $VAR/baseline ]]; then
+  read -r b_cps b_conns b_pps b_http_rps < "$VAR/baseline"
+  b_http_rps="${b_http_rps:-0}"   # baseline créée par une version antérieure sans HTTP : défaut 0
+  cycle=$WARMUP_CYCLES
+  log "Baseline restaurée : ${b_cps} co/s, ${b_conns} connexions, ${b_pps} pps, ${b_http_rps} req/s HTTP"
+fi
+
+trap 'lockdown_off quiet; echo "$b_cps $b_conns $b_pps $b_http_rps" > "$VAR/baseline"; log "Arrêt du démon"; exit 0' TERM INT
+lockdown_off quiet
+
+read -r P0 B0 <<< "$(ifstat)"; N0=$(counter newconns); D0=$(counter dropped)
+log "Démarrage — interface $INTERFACE, ports $PORTS, analyse toutes les ${INTERVAL}s"
+
+# ---------- boucle principale ----------
+while true; do
+  sleep "$INTERVAL" & wait $!
+  cycle=$((cycle + 1))
+
+  read -r P1 B1 <<< "$(ifstat)"; N1=$(counter newconns); D1=$(counter dropped)
+  pps=$(( (P1 - P0) / INTERVAL )); cps=$(( (N1 - N0) / INTERVAL )); dps=$(( (D1 - D0) / INTERVAL ))
+  mbps=$(fcalc "($B1-$B0)*8/$INTERVAL/1000000")
+  (( pps < 0 )) && pps=0; (( cps < 0 )) && cps=0; (( dps < 0 )) && dps=0
+  P0=$P1; B0=$B1; N0=$N1; D0=$D1
+
+  EST=$(peers established)
+  conns=$(grep -c . <<< "$EST")
+  syn=$(ss -Htn state syn-recv "${SS_ARGS[@]}" 2>/dev/null | wc -l)
+
+  http_scan   # met à jour HTTP_TOTAL (+ bannit directement les IP qui dépassent le seuil par IP)
+  http_rps=$(( HTTP_TOTAL / INTERVAL ))
+
+  # --- détection ---
+  reasons=()
+  if (( cycle > WARMUP_CYCLES )); then
+    (( cps   >= MIN_CPS   )) && fgt "$cps"   "$(fcalc "$b_cps*$SPIKE_FACTOR")"   && reasons+=(conn_flood)
+    (( conns >= MIN_CONNS )) && fgt "$conns" "$(fcalc "$b_conns*$SPIKE_FACTOR")" && reasons+=(bot_flood)
+    (( pps   >= MIN_PPS   )) && fgt "$pps"   "$(fcalc "$b_pps*$SPIKE_FACTOR")"   && reasons+=(volumetric)
+    (( HTTP_ENABLE )) && (( http_rps >= HTTP_MIN_RPS )) && fgt "$http_rps" "$(fcalc "$b_http_rps*$HTTP_SPIKE_FACTOR")" && reasons+=(http_flood)
+  fi
+  (( syn >= SYN_RECV_MAX ))   && reasons+=(syn_flood)
+  (( dps >= DROP_ALERT_PPS )) && reasons+=(filtered_flood)
+
+  if (( ${#reasons[@]} )); then
+    calm=0
+    A_LAST=$(date -Iseconds); A_LAST_TS=$(date +%s)
+    if [[ -z $ATTACK_ID ]]; then
+      ATTACK_ID="${SERVER_NAME}-$(date +%Y%m%d-%H%M%S)"
+      A_START=$A_LAST; A_START_TS=$A_LAST_TS; A_DROPPED=0
+      A_TYPES=(); BANNED=(); pk_pps=0; pk_mbps=0; pk_cps=0; pk_conns=0; pk_syn=0; pk_http_rps=0
+      log "⚠️  ATTAQUE DÉTECTÉE [$ATTACK_ID] ${reasons[*]} — ${cps} co/s (base ${b_cps}), ${conns} conn. (base ${b_conns}), ${pps} pps, ${mbps} Mbps, ${syn} SYN_RECV, ${http_rps} req/s HTTP (base ${b_http_rps})"
+      lockdown_on
+      started=1
+    fi
+    for r in "${reasons[@]}"; do A_TYPES[$r]=1; done
+  fi
+
+  if [[ -n $ATTACK_ID ]]; then
+    (( pps > pk_pps ))     && pk_pps=$pps
+    (( cps > pk_cps ))     && pk_cps=$cps
+    (( conns > pk_conns )) && pk_conns=$conns
+    (( syn > pk_syn ))     && pk_syn=$syn
+    (( http_rps > pk_http_rps )) && pk_http_rps=$http_rps
+    fgt "$mbps" "$pk_mbps" && pk_mbps=$mbps
+    A_DROPPED=$(( A_DROPPED + dps * INTERVAL ))
+    if (( started )); then api_send "$(attack_json attack_started)"; started=0; fi
+  fi
+
+  # --- mitigation par IP ---
+  if (( AUTO_BAN )); then
+    limit=$PER_IP_MAX_CONN; [[ -n $ATTACK_ID ]] && limit=$PER_IP_MAX_CONN_ATTACK
+    if [[ -n $EST ]]; then
+      while read -r n ip; do
+        (( n > limit )) || break
+        ban "$ip" "$n connexions simultanées"
+      done < <(sort <<< "$EST" | uniq -c | sort -rn)
+    fi
+    if [[ -n $ATTACK_ID ]] && (( syn > 0 )); then
+      while read -r n ip; do
+        (( n > SYN_PER_IP_MAX )) || break
+        ban "$ip" "$n SYN_RECV"
+      done < <(peers syn-recv | sort | uniq -c | sort -rn)
+    fi
+  fi
+
+  # --- fin d'attaque ---
+  if [[ -n $ATTACK_ID ]] && (( ${#reasons[@]} == 0 )); then
+    calm=$((calm + 1))
+    if (( calm >= END_CALM_CYCLES )); then
+      log "✅ Fin de l'attaque [$ATTACK_ID] — $(( A_LAST_TS - A_START_TS ))s, pic ${pk_cps} co/s, ${pk_conns} conn., ${pk_pps} pps, ${pk_mbps} Mbps, ${#BANNED[@]} IP bannies"
+      api_send "$(attack_json attack_ended "$A_LAST")"
+      lockdown_off
+      ATTACK_ID=""; calm=0
+    fi
+  fi
+
+  # --- apprentissage (uniquement hors attaque) ---
+  if [[ -z $ATTACK_ID ]]; then
+    a=0.05; (( cycle <= WARMUP_CYCLES )) && a=0.3
+    b_cps=$(fcalc "$b_cps*(1-$a)+$cps*$a")
+    b_conns=$(fcalc "$b_conns*(1-$a)+$conns*$a")
+    b_pps=$(fcalc "$b_pps*(1-$a)+$pps*$a")
+    (( HTTP_ENABLE )) && b_http_rps=$(fcalc "$b_http_rps*(1-$a)+$http_rps*$a")
+    (( cycle % 30 == 0 )) && echo "$b_cps $b_conns $b_pps $b_http_rps" > "$VAR/baseline"
+    if (( cycle % 5 == 0 )) && [[ -n $EST ]]; then
+      k4=$(sort -u <<< "$EST" | grep -v : | paste -sd, -)
+      k6=$(sort -u <<< "$EST" | grep : | paste -sd, -)
+      [[ -n $k4 ]] && nft add element inet $T known4 "{ $k4 }" 2>/dev/null
+      [[ -n $k6 ]] && nft add element inet $T known6 "{ $k6 }" 2>/dev/null
+    fi
+  fi
+
+  (( cycle % 15 == 0 )) && flush_spool
+  (( cycle % CMD_POLL_EVERY == 0 )) && poll_commands
+  (( HTTP_ENABLE )) && (( cycle % HTTP_RESCAN_EVERY == 0 )) && http_discover   # capte les nouveaux vhosts
+
+  jq -nc --argjson pps "$pps" --argjson mbps "$mbps" --argjson cps "$cps" --argjson conns "$conns" \
+    --argjson syn "$syn" --argjson dps "$dps" --argjson httprps "$http_rps" \
+    --argjson bc "$b_cps" --argjson bn "$b_conns" \
+    --argjson bp "$b_pps" --argjson bh "$b_http_rps" \
+    --arg attack "$ATTACK_ID" --argjson learning "$(( cycle <= WARMUP_CYCLES ))" \
+    '{ts:(now|todate), pps:$pps, mbps:$mbps, new_conn_per_s:$cps, conns:$conns, syn_recv:$syn,
+      http_rps:$httprps,
+      dropped_per_s:$dps, baseline:{new_conn_per_s:$bc, conns:$bn, pps:$bp, http_rps:$bh},
+      learning:($learning==1), attack:(if $attack=="" then null else $attack end)}' \
+    > "$RUN/metrics.json"
+done

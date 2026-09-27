@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ETC=/etc/craftpick-api
+[[ -f $ETC/config.json ]] || { echo "Craftpick API non installée."; exit 1; }
+PORT=$(node -e "console.log(require('$ETC/config.json').port)")
+KEY=$(node -e "console.log(require('$ETC/config.json').apiKey)")
+BASE="http://127.0.0.1:${PORT}"
+auth=(-H "Authorization: Bearer $KEY")
+
+case "${1:-}" in
+  status)
+    systemctl is-active --quiet craftpick-api && echo "Service : ✅ actif" || echo "Service : ❌ inactif"
+    curl -fsS "${auth[@]}" "$BASE/servers" 2>/dev/null | node -e '
+      let d=""; process.stdin.on("data",c=>d+=c).on("end",()=>{
+        const s=JSON.parse(d||"{}"); const names=Object.keys(s);
+        if(!names.length){console.log("Aucun serveur connu pour le moment.");return;}
+        for(const n of names){const v=s[n];
+          console.log(`- ${n} : vu ${v.lastSeen||"?"}${v.openAttack? " — ⚠️ ATTAQUE EN COURS ("+(v.openAttack.types||[]).join(",")+")":""}`);}
+      });' ;;
+  key)             echo "$KEY" ;;
+  url)             echo "$BASE/docs" ;;
+  regenerate-key)
+    [[ $EUID -eq 0 ]] || { echo "Root requis (sudo)."; exit 1; }
+    NEWKEY=$(node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')
+    node -e "const f=require('$ETC/config.json'); f.apiKey='$NEWKEY'; require('fs').writeFileSync('$ETC/config.json', JSON.stringify(f,null,2));"
+    systemctl restart craftpick-api
+    echo "Nouvelle clé : $NEWKEY"
+    echo "⚠️  Mets à jour API_KEY dans /etc/craftpick-filter/config.conf sur chaque serveur, puis: craftpick-filter reload" ;;
+  servers)         curl -fsS "${auth[@]}" "$BASE/servers" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.stringify(JSON.parse(d||"{}"),null,2)))' ;;
+  attacks)         [[ -n ${2:-} ]] || { echo "Usage: $0 attacks <serveur>"; exit 1; }
+                   curl -fsS "${auth[@]}" "$BASE/servers/$2/attacks" | node -e 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>console.log(JSON.stringify(JSON.parse(d||"[]"),null,2)))' ;;
+  ban)             [[ -n ${3:-} ]] || { echo "Usage: $0 ban <serveur> <ip> [durée ex: 2h]"; exit 1; }
+                   curl -fsS "${auth[@]}" -X POST -H "Content-Type: application/json" \
+                     -d "{\"ip\":\"$3\",\"duration\":\"${4:-1h}\"}" "$BASE/servers/$2/ban"; echo ;;
+  unban)           [[ -n ${3:-} ]] || { echo "Usage: $0 unban <serveur> <ip>"; exit 1; }
+                   curl -fsS "${auth[@]}" -X POST -H "Content-Type: application/json" \
+                     -d "{\"ip\":\"$3\"}" "$BASE/servers/$2/unban"; echo ;;
+  whitelist)       [[ -n ${3:-} ]] || { echo "Usage: $0 whitelist <serveur> <ip>"; exit 1; }
+                   curl -fsS "${auth[@]}" -X POST -H "Content-Type: application/json" \
+                     -d "{\"ip\":\"$3\"}" "$BASE/servers/$2/whitelist"; echo ;;
+  lockdown)        [[ -n ${3:-} ]] || { echo "Usage: $0 lockdown <serveur> on|off"; exit 1; }
+                   curl -fsS "${auth[@]}" -X POST -H "Content-Type: application/json" \
+                     -d "{\"state\":\"$3\"}" "$BASE/servers/$2/lockdown"; echo ;;
+  logs)            tail -n 50 -f /var/log/craftpick-api.log ;;
+  *)
+    cat <<USAGE
+Craftpick API — commandes :
+  status                       état du service + serveurs connus
+  key                          afficher la clé API
+  url                          afficher l'URL de la doc
+  regenerate-key               générer une nouvelle clé (root)
+  servers                      détail JSON des serveurs connus
+  attacks <serveur>            historique des attaques
+  ban <serveur> <ip> [durée]   bannir une IP à distance (ex: 2h, 30m, 1d)
+  unban <serveur> <ip>         débannir
+  whitelist <serveur> <ip>     whitelister
+  lockdown <serveur> on|off    forcer le mode lockdown
+  logs                         suivre les logs
+USAGE
+    ;;
+esac
